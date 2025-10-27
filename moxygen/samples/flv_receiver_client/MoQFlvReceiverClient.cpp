@@ -241,7 +241,7 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
       if (seqId.has_value()) {
         // Only for video frames with seqId we update metrics
         if (payloadDecodedData.index() ==
-                MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC &&) {
+                MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC) {
           updateMetrics(now, seqId.value(), pts, sendTimestamp, receiveTimestamp);
                 }
       }
