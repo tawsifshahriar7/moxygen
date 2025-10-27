@@ -8,17 +8,18 @@
 #include <folly/io/async/AsyncSignalHandler.h>
 #include <folly/portability/GFlags.h>
 #include <signal.h>
+
+#include <chrono>
 #include <filesystem>
+
 #include "moxygen/MoQWebTransportClient.h"
 #include "moxygen/flv_parser/FlvReader.h"
 #include "moxygen/moq_mi/MoQMi.h"
 #include "moxygen/relay/MoQRelayClient.h"
 
 DEFINE_string(input_flv_file, "", "FLV input fifo file");
-DEFINE_string(
-    connect_url,
-    "https://localhost:4433/moq",
-    "URL for webtransport server");
+DEFINE_string(connect_url, "https://localhost:4433/moq",
+              "URL for webtransport server");
 DEFINE_string(track_namespace, "flvstreamer", "Track Namespace");
 DEFINE_string(track_namespace_delimiter, "/", "Track Namespace Delimiter");
 DEFINE_string(video_track_name, "video0", "Video track Name");
@@ -30,15 +31,16 @@ DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 namespace {
 using namespace moxygen;
 
+// Custom extension type for absolute send timestamp (even number for integer
+// value)
+constexpr uint64_t kTimestampExtensionType = 0x100;
+
 class MoQFlvStreamerClient
     : public Publisher,
       public std::enable_shared_from_this<MoQFlvStreamerClient> {
  public:
-  MoQFlvStreamerClient(
-      folly::EventBase* evb,
-      proxygen::URL url,
-      FullTrackName fvtn,
-      FullTrackName fatn)
+  MoQFlvStreamerClient(folly::EventBase* evb, proxygen::URL url,
+                       FullTrackName fvtn, FullTrackName fatn)
       : moqExecutor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
         moqClient_(moqExecutor_, std::move(url)),
         fullVideoTrackName_(std::move(fvtn)),
@@ -147,11 +149,9 @@ class MoQFlvStreamerClient
     AbsoluteLocation largest;
     // Location mode not supported
     if (subscribeReq.locType != LocationType::LargestObject) {
-      co_return folly::makeUnexpected(
-          SubscribeError{
-              subscribeReq.requestID,
-              SubscribeErrorCode::NOT_SUPPORTED,
-              "Only location LargestObject mode supported"});
+      co_return folly::makeUnexpected(SubscribeError{
+          subscribeReq.requestID, SubscribeErrorCode::NOT_SUPPORTED,
+          "Only location LargestObject mode supported"});
     }
     // Track not available
     auto alias = subscribeReq.trackAlias.value_or(
@@ -165,24 +165,20 @@ class MoQFlvStreamerClient
       largest = largestAudio_;
       audioPub_ = std::move(consumer);
     } else {
-      co_return folly::makeUnexpected(
-          SubscribeError{
-              subscribeReq.requestID,
-              SubscribeErrorCode::TRACK_NOT_EXIST,
-              "Full trackname NOT available"});
+      co_return folly::makeUnexpected(SubscribeError{
+          subscribeReq.requestID, SubscribeErrorCode::TRACK_NOT_EXIST,
+          "Full trackname NOT available"});
     }
     // Save subscribe
     auto subscription = std::make_shared<Subscription>(
-        SubscribeOk{
-            subscribeReq.requestID,
-            alias,
-            std::chrono::milliseconds(0),
-            MoQSession::resolveGroupOrder(
-                GroupOrder::OldestFirst, subscribeReq.groupOrder),
-            largest,
-            {}},
-        consumerPtr,
-        *this);
+        SubscribeOk{subscribeReq.requestID,
+                    alias,
+                    std::chrono::milliseconds(0),
+                    MoQSession::resolveGroupOrder(GroupOrder::OldestFirst,
+                                                  subscribeReq.groupOrder),
+                    largest,
+                    {}},
+        consumerPtr, *this);
     subscriptions_.emplace(subscribeReq.requestID, subscription);
     XLOG(INFO) << "Subscribed " << subscribeReq.requestID;
 
@@ -199,16 +195,26 @@ class MoQFlvStreamerClient
       XLOG(ERR) << "Failed to encode audio frame";
       return;
     }
-    ObjectHeader objHeader = ObjectHeader{
-        largestAudio_.group++,
-        /*subgroupIn=*/0,
-        largestAudio_.object,
-        AUDIO_STREAM_PRIORITY,
-        ObjectStatus::NORMAL,
-        Extensions(std::move(moqMiObj->extensions), {})};
+
+    // Add absolute timestamp extension
+    auto sendTimestamp =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    moqMiObj->extensions.push_back(
+        Extension(kTimestampExtensionType, sendTimestamp));
+
+    ObjectHeader objHeader =
+        ObjectHeader{largestAudio_.group++,
+                     /*subgroupIn=*/0,
+                     largestAudio_.object,
+                     AUDIO_STREAM_PRIORITY,
+                     ObjectStatus::NORMAL,
+                     Extensions(std::move(moqMiObj->extensions), {})};
 
     XLOG(DBG1) << "Sending audio frame" << objHeader << ", payload size: "
-               << moqMiObj->payload->computeChainDataLength();
+               << moqMiObj->payload->computeChainDataLength()
+               << ", timestamp: " << sendTimestamp;
     audioPub_->objectStream(objHeader, std::move(moqMiObj->payload));
   }
 
@@ -237,6 +243,14 @@ class MoQFlvStreamerClient
       return;
     }
 
+    // Add absolute timestamp extension
+    auto sendTimestamp =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    moqMiObj->extensions.push_back(
+        Extension(kTimestampExtensionType, sendTimestamp));
+
     if (isIdr) {
       if (videoSgPub_) {
         // Close previous subgroup
@@ -246,8 +260,8 @@ class MoQFlvStreamerClient
         largestVideo_.object = 0;
       }
       // Open new subgroup
-      auto res = videoPub_->beginSubgroup(
-          largestVideo_.group, 0, VIDEO_STREAM_PRIORITY);
+      auto res = videoPub_->beginSubgroup(largestVideo_.group, 0,
+                                          VIDEO_STREAM_PRIORITY);
       if (!res) {
         XLOG(ERR) << "Error creating subgroup";
       }
@@ -258,11 +272,10 @@ class MoQFlvStreamerClient
     if (videoSgPub_) {
       XLOG(DBG1) << "Sending video frame. grp-obj: " << largestVideo_.group
                  << "-" << largestVideo_.object << ". Payload size: "
-                 << moqMiObj->payload->computeChainDataLength();
-      videoSgPub_->object(
-          largestVideo_.object++,
-          std::move(moqMiObj->payload),
-          Extensions(std::move(moqMiObj->extensions), {}));
+                 << moqMiObj->payload->computeChainDataLength()
+                 << ", timestamp: " << sendTimestamp;
+      videoSgPub_->object(largestVideo_.object++, std::move(moqMiObj->payload),
+                          Extensions(std::move(moqMiObj->extensions), {}));
     } else {
       XLOG(ERR) << "Should not happen";
     }
@@ -282,10 +295,8 @@ class MoQFlvStreamerClient
   AbsoluteLocation largestAudio_{0, 0};
 
   struct Subscription : public Publisher::SubscriptionHandle {
-    Subscription(
-        SubscribeOk ok,
-        TrackConsumer* consumerPtr,
-        MoQFlvStreamerClient& client)
+    Subscription(SubscribeOk ok, TrackConsumer* consumerPtr,
+                 MoQFlvStreamerClient& client)
         : SubscriptionHandle(std::move(ok)),
           consumer(consumerPtr),
           client_(client) {}
@@ -309,12 +320,10 @@ class MoQFlvStreamerClient
   std::shared_ptr<TrackConsumer> videoPub_;
   std::shared_ptr<SubgroupConsumer> videoSgPub_;
 };
-} // namespace
+}  // namespace
 
 using namespace moxygen;
-namespace {
-
-} // namespace
+namespace {}  // namespace
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, false);
@@ -329,16 +338,15 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  XLOGF(
-      INFO,
-      "Starting publisher that will use: Stream(subGroup) per object for audio and Stream(subGroup) per GOP for video. Input file/pipe: {}",
-      FLAGS_input_flv_file);
+  XLOGF(INFO,
+        "Starting publisher that will use: Stream(subGroup) per object for "
+        "audio and Stream(subGroup) per GOP for video. Input file/pipe: {}",
+        FLAGS_input_flv_file);
 
   TrackNamespace ns =
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);
   auto streamerClient = std::make_shared<MoQFlvStreamerClient>(
-      &eventBase,
-      std::move(url),
+      &eventBase, std::move(url),
       moxygen::FullTrackName({ns, FLAGS_video_track_name}),
       moxygen::FullTrackName({ns, FLAGS_audio_track_name}));
 
@@ -368,8 +376,8 @@ int main(int argc, char* argv[]) {
   SigHandler handler(
       &eventBase, [&streamerClient](int) mutable { streamerClient->stop(); });
 
-  co_withExecutor(
-      &eventBase, streamerClient->run({RequestID(0), {std::move(ns)}, {}}))
+  co_withExecutor(&eventBase,
+                  streamerClient->run({RequestID(0), {std::move(ns)}, {}}))
       .start()
       .via(&eventBase)
       .thenTry([&handler](auto) { handler.unreg(); });

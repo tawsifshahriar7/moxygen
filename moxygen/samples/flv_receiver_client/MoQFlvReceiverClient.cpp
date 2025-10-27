@@ -4,42 +4,44 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/init/Init.h>
+#include <folly/io/async/AsyncSignalHandler.h>
 #include <folly/portability/GFlags.h>
+#include <signal.h>
+
+#include <chrono>
+#include <fstream>
+
 #include "moxygen/MoQClient.h"
 #include "moxygen/MoQWebTransportClient.h"
 #include "moxygen/ObjectReceiver.h"
-
-#include <folly/init/Init.h>
-#include <folly/io/async/AsyncSignalHandler.h>
-#include <signal.h>
 #include "moxygen/dejitter/DeJitter.h"
 #include "moxygen/flv_parser/FlvWriter.h"
 #include "moxygen/moq_mi/MoQMi.h"
 
-DEFINE_string(
-    connect_url,
-    "https://localhost:4433/moq",
-    "URL for webtransport server");
-DEFINE_string(
-    flv_outpath,
-    "",
-    "File name to save the received FLV file to (ex: /tmp/test.flv)");
+DEFINE_string(connect_url, "https://localhost:4433/moq",
+              "URL for webtransport server");
+DEFINE_string(flv_outpath, "",
+              "File name to save the received FLV file to (ex: /tmp/test.flv)");
+DEFINE_string(stats_log_file, "/tmp/moq_stats.log",
+              "File name to save statistics (FPS, delay, jitter)");
 DEFINE_string(track_namespace, "flvstreamer", "Track Namespace");
 DEFINE_string(track_namespace_delimiter, "/", "Track Namespace Delimiter");
 DEFINE_string(video_track_name, "video0", "Video track Name");
 DEFINE_string(audio_track_name, "audio0", "Track Name");
 DEFINE_int32(connect_timeout, 1000, "Connect timeout (ms)");
 DEFINE_int32(transaction_timeout, 120, "Transaction timeout (s)");
-DEFINE_int32(
-    dejitter_buffer_size_ms,
-    300,
-    "Dejitter buffer size in ms (this translates to added latency)");
+DEFINE_int32(dejitter_buffer_size_ms, 300,
+             "Dejitter buffer size in ms (this translates to added latency)");
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 DEFINE_bool(fetch, false, "Use fetch rather than subscribe");
 DEFINE_string(auth, "secret", "MOQ subscription auth string");
 
 namespace {
 using namespace moxygen;
+
+// Custom extension type for absolute send timestamp (must match sender)
+constexpr uint64_t kTimestampExtensionType = 0x100;
 
 class TrackType {
  public:
@@ -80,9 +82,9 @@ class FlvWriterShared : flv::FlvWriter {
 
       // Since PTS >= DTS lets check 1st PTS for rollover
       uint32_t pts =
-          static_cast<int32_t>(moqv->pts & 0x7FFFFFFF); // 31 lower bits
+          static_cast<int32_t>(moqv->pts & 0x7FFFFFFF);  // 31 lower bits
       uint32_t dts =
-          static_cast<int32_t>(moqv->dts & 0x7FFFFFFF); // 31 lower bits
+          static_cast<int32_t>(moqv->dts & 0x7FFFFFFF);  // 31 lower bits
       // This already handles the case where PTS rolled over and DTS NOT yet
       int32_t compositionTime = pts - dts;
       if (moqv->pts > std::numeric_limits<int32_t>::max()) {
@@ -94,8 +96,8 @@ class FlvWriterShared : flv::FlvWriter {
 
       if (moqv->metadata != nullptr && !videoHeaderWritten_) {
         XLOG(INFO) << "Writing video header";
-        auto vhtag = flv::createVideoTag(
-            pts, 1, 7, 0, compositionTime, std::move(moqv->metadata));
+        auto vhtag = flv::createVideoTag(pts, 1, 7, 0, compositionTime,
+                                         std::move(moqv->metadata));
         ret = writeTag(std::move(vhtag));
         if (!ret) {
           return ret;
@@ -109,13 +111,9 @@ class FlvWriterShared : flv::FlvWriter {
           // Write frame
           uint8_t frameType = isIdr ? 1 : 0;
           XLOG(DBG1) << "Writing video frame, type: " << frameType;
-          auto vtag = flv::createVideoTag(
-              moqv->pts,
-              frameType,
-              7,
-              1,
-              compositionTime,
-              std::move(moqv->data));
+          auto vtag =
+              flv::createVideoTag(moqv->pts, frameType, 7, 1, compositionTime,
+                                  std::move(moqv->data));
           ret = writeTag(std::move(vtag));
           if (isIdr && !firstIDRWritten_) {
             firstIDRWritten_ = true;
@@ -123,9 +121,8 @@ class FlvWriterShared : flv::FlvWriter {
           }
         }
       }
-    } else if (
-        moqMiItem.index() ==
-        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
+    } else if (moqMiItem.index() ==
+               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
       auto moqa = std::move(
           std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC>(
               moqMiItem));
@@ -133,7 +130,7 @@ class FlvWriterShared : flv::FlvWriter {
         XLOG(INFO) << "Writing audio header";
         auto ascHeader = moqa->getAscHeader();
         uint32_t pts =
-            static_cast<int32_t>(moqa->pts & 0x7FFFFFFF); // 31 lower bits
+            static_cast<int32_t>(moqa->pts & 0x7FFFFFFF);  // 31 lower bits
         if (moqa->pts > std::numeric_limits<int32_t>::max()) {
           XLOG_EVERY_N(WARNING, 1000)
               << "PTS audio truncated! Rolling over. From " << moqa->pts
@@ -149,8 +146,8 @@ class FlvWriterShared : flv::FlvWriter {
       }
       if (audioHeaderWritten_) {
         XLOG(DBG1) << "Writing audio frame";
-        auto atag = flv::createAudioTag(
-            moqa->pts, 10, 3, 1, 1, 1, std::move(moqa->data));
+        auto atag = flv::createAudioTag(moqa->pts, 10, 3, 1, 1, 1,
+                                        std::move(moqa->data));
         ret = writeTag(std::move(atag));
       }
     }
@@ -171,30 +168,84 @@ class FlvWriterShared : flv::FlvWriter {
 
 class TrackReceiverHandler : public ObjectReceiverCallback {
  public:
-  explicit TrackReceiverHandler(
-      TrackType::MediaType mediaType,
-      uint32_t dejitterBufferSizeMs)
+  explicit TrackReceiverHandler(TrackType::MediaType mediaType,
+                                uint32_t dejitterBufferSizeMs,
+                                const std::string& statsLogFile)
       : trackMediaType_(TrackType(mediaType)),
-        dejitterBufferSizeMs_(dejitterBufferSizeMs) {}
-  ~TrackReceiverHandler() override = default;
-  FlowControlState onObject(
-      folly::Optional<TrackAlias> /*trackAlias*/,
-      const ObjectHeader& objHeader,
-      Payload payload) override {
+        dejitterBufferSizeMs_(dejitterBufferSizeMs),
+        statsLogFile_(statsLogFile) {
+    statsLogStream_.open(statsLogFile_, std::ios::app);
+    std::cout << "Opened stats log file: " << statsLogFile_ << std::endl;
+    if (!statsLogStream_.is_open()) {
+      XLOG(ERR) << "Failed to open stats log file: " << statsLogFile_;
+    } else {
+      statsLogStream_
+          << "\n=== " << trackMediaType_.toStr() << " Stream Started at "
+          << std::chrono::system_clock::now().time_since_epoch().count()
+          << " ===\n";
+      statsLogStream_ << "ReceiveTimestamp,SeqId,PTS,SendTimestamp,"
+                         "InterArrivalTime(ms),FrameDelay(ms),Jitter(ms),"
+                         "FPS,AvgDelay(ms)\n";
+      statsLogStream_.flush();
+    }
+  }
+  ~TrackReceiverHandler() override {
+    if (statsLogStream_.is_open()) {
+      dumpFinalStats();
+      statsLogStream_.close();
+    }
+  }
+  FlowControlState onObject(folly::Optional<TrackAlias> /*trackAlias*/,
+                            const ObjectHeader& objHeader,
+                            Payload payload) override {
+    auto now = std::chrono::steady_clock::now();
+    auto receiveTimestamp =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch())
+            .count();
+
     if (payload) {
-      std::tuple<
-          folly::Optional<MoQMi::MoqMiItem>,
-          dejitter::DeJitter<MoQMi::MoqMiItem>::GapInfo>
+      std::tuple<folly::Optional<MoQMi::MoqMiItem>,
+                 dejitter::DeJitter<MoQMi::MoqMiItem>::GapInfo>
           deJitterData;
 
       auto payloadSize = payload->computeChainDataLength();
       XLOG(DBG1) << trackMediaType_.toStr()
                  << " Received payload. Size=" << payloadSize;
 
-      auto payloadDecodedData = MoQMi::decodeMoQMi(
-          std::make_unique<MoQMi::MoqMiObject>(
+      // Extract send timestamp from extensions
+      folly::Optional<uint64_t> sendTimestamp;
+      for (const auto& ext : objHeader.extensions.getMutableExtensions()) {
+        if (ext.type == kTimestampExtensionType) {
+          sendTimestamp = ext.intValue;
+          break;
+        }
+      }
+      if (!sendTimestamp.has_value()) {
+        for (const auto& ext : objHeader.extensions.getImmutableExtensions()) {
+          if (ext.type == kTimestampExtensionType) {
+            sendTimestamp = ext.intValue;
+            break;
+          }
+        }
+      }
+
+      auto payloadDecodedData =
+          MoQMi::decodeMoQMi(std::make_unique<MoQMi::MoqMiObject>(
               objHeader.extensions.getMutableExtensions(), std::move(payload)));
       logData(payloadDecodedData);
+
+      // Calculate metrics
+      auto seqId = getSeqId(payloadDecodedData);
+      auto pts = getPTS(payloadDecodedData);
+      if (seqId.has_value()) {
+        // Only for video frames with seqId we update metrics
+        if (payloadDecodedData.index() ==
+                MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC &&) {
+          updateMetrics(now, seqId.value(), pts, sendTimestamp, receiveTimestamp);
+                }
+      }
+
       if (payloadDecodedData.index() ==
               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC ||
           payloadDecodedData.index() ==
@@ -213,9 +264,9 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
         } else {
           auto sDurMs = getDurationMs(payloadDecodedData);
           if (!sDurMs.has_value()) {
-            XLOG(WARN)
-                << trackMediaType_.toStr()
-                << " No duration found, this affects dejitter buffer size, assuming 0ms";
+            XLOG(WARN) << trackMediaType_.toStr()
+                       << " No duration found, this affects dejitter buffer "
+                          "size, assuming 0ms";
           }
           deJitterData = deJitter_->insertItem(
               seqId.value(), sDurMs.value_or(0), std::move(payloadDecodedData));
@@ -223,22 +274,21 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
               dejitter::DeJitter<MoQMi::MoqMiItem>::GapType::FILLING_BUFFER) {
             XLOG(DBG1) << trackMediaType_.toStr()
                        << " Filling buffer for seqId: " << seqId.value();
-          } else if (
-              std::get<1>(deJitterData).gapType ==
-              dejitter::DeJitter<MoQMi::MoqMiItem>::GapType::ARRIVED_LATE) {
+          } else if (std::get<1>(deJitterData).gapType ==
+                     dejitter::DeJitter<
+                         MoQMi::MoqMiItem>::GapType::ARRIVED_LATE) {
             XLOG(WARN) << trackMediaType_.toStr()
                        << " Dropped, because arrived late. seqId: "
                        << seqId.value();
-          } else if (
-              std::get<1>(deJitterData).gapType ==
-              dejitter::DeJitter<MoQMi::MoqMiItem>::GapType::GAP) {
+          } else if (std::get<1>(deJitterData).gapType ==
+                     dejitter::DeJitter<MoQMi::MoqMiItem>::GapType::GAP) {
             XLOG(WARN) << trackMediaType_.toStr()
                        << " GAP PASSED to decoder, size: "
                        << std::get<1>(deJitterData).gapSize
                        << ", seqId: " << seqId.value();
-          } else if (
-              std::get<1>(deJitterData).gapType ==
-              dejitter::DeJitter<MoQMi::MoqMiItem>::GapType::INTERNAL_ERROR) {
+          } else if (std::get<1>(deJitterData).gapType ==
+                     dejitter::DeJitter<
+                         MoQMi::MoqMiItem>::GapType::INTERNAL_ERROR) {
             XLOG(ERR) << trackMediaType_.toStr()
                       << " INTERNAL ERROR dejittering, seqId: "
                       << seqId.value();
@@ -262,9 +312,8 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
     }
     return FlowControlState::UNBLOCKED;
   }
-  void onObjectStatus(
-      folly::Optional<TrackAlias> /*trackAlias*/,
-      const ObjectHeader& objHeader) override {
+  void onObjectStatus(folly::Optional<TrackAlias> /*trackAlias*/,
+                      const ObjectHeader& objHeader) override {
     std::cout << trackMediaType_.toStr()
               << " ObjectStatus=" << uint32_t(objHeader.status) << std::endl;
   }
@@ -274,9 +323,7 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
               << " Stream Error=" << folly::to_underlying(error) << std::endl;
     ;
   }
-  void onSubscribeDone(SubscribeDone) override {
-    baton.post();
-  }
+  void onSubscribeDone(SubscribeDone) override { baton.post(); }
 
   folly::coro::Baton baton;
 
@@ -293,9 +340,8 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
           << *std::get<
                  MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC>(
                  payloadDecodedData);
-    } else if (
-        payloadDecodedData.index() ==
-        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
+    } else if (payloadDecodedData.index() ==
+               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
       XLOG(DBG1)
           << trackMediaType_.toStr() << " payloadDecodedData: "
           << *std::get<
@@ -312,9 +358,8 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
                  MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC>(
                  payloadDecodedData)
           ->seqId;
-    } else if (
-        payloadDecodedData.index() ==
-        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
+    } else if (payloadDecodedData.index() ==
+               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
       return std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC>(
                  payloadDecodedData)
           ->seqId;
@@ -337,9 +382,8 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
           std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC>(
               payloadDecodedData)
               ->timescale;
-    } else if (
-        payloadDecodedData.index() ==
-        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
+    } else if (payloadDecodedData.index() ==
+               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
       dur = std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC>(
                 payloadDecodedData)
                 ->duration;
@@ -354,21 +398,162 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
     return dur.value() * 1000 / timeScale.value();
   }
 
+  folly::Optional<uint64_t> getPTS(
+      const MoQMi::MoqMiItem& payloadDecodedData) const {
+    if (payloadDecodedData.index() ==
+        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC) {
+      return std::get<
+                 MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC>(
+                 payloadDecodedData)
+          ->pts;
+    } else if (payloadDecodedData.index() ==
+               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
+      return std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC>(
+                 payloadDecodedData)
+          ->pts;
+    }
+    return folly::none;
+  }
+
+  void updateMetrics(std::chrono::steady_clock::time_point now, uint64_t seqId,
+                     folly::Optional<uint64_t> pts,
+                     folly::Optional<uint64_t> sendTimestamp,
+                     uint64_t receiveTimestamp) {
+    frameCount_++;
+
+    // Calculate actual frame delay (end-to-end latency)
+    double currentDelay = 0.0;
+    if (sendTimestamp.has_value()) {
+      currentDelay = receiveTimestamp - sendTimestamp.value();
+      totalDelay_ += currentDelay;
+      delayCount_++;
+
+      if (currentDelay > maxDelay_) {
+        maxDelay_ = currentDelay;
+      }
+      if (minDelay_ < 0 || currentDelay < minDelay_) {
+        minDelay_ = currentDelay;
+      }
+    }
+
+    // Calculate inter-arrival time and jitter
+    if (lastArrivalTime_.time_since_epoch().count() > 0) {
+      auto interArrivalTime =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - lastArrivalTime_)
+              .count();
+
+      if (lastInterArrivalTime_ > 0) {
+        // Jitter = |current_inter_arrival - last_inter_arrival|
+        double currentJitter =
+            std::abs(interArrivalTime - lastInterArrivalTime_);
+        jitterSum_ += currentJitter;
+        jitterCount_++;
+
+        // Update max jitter
+        if (currentJitter > maxJitter_) {
+          maxJitter_ = currentJitter;
+        }
+      }
+
+      lastInterArrivalTime_ = interArrivalTime;
+    }
+
+    lastArrivalTime_ = now;
+
+    // Calculate FPS every second
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now - fpsStartTime_)
+                       .count();
+    if (elapsed >= 1000) {
+      currentFPS_ = (frameCount_ - lastFrameCount_) * 1000.0 / elapsed;
+      lastFrameCount_ = frameCount_;
+      fpsStartTime_ = now;
+    }
+
+    // Log to file
+    if (statsLogStream_.is_open()) {
+      double avgJitter = jitterCount_ > 0 ? jitterSum_ / jitterCount_ : 0.0;
+      double avgDelay = delayCount_ > 0 ? totalDelay_ / delayCount_ : 0.0;
+
+      statsLogStream_ << receiveTimestamp << "," << seqId << ","
+                      << (pts.has_value() ? std::to_string(pts.value()) : "N/A")
+                      << ","
+                      << (sendTimestamp.has_value()
+                              ? std::to_string(sendTimestamp.value())
+                              : "N/A")
+                      << "," << lastInterArrivalTime_ << "," << currentDelay
+                      << "," << (jitterCount_ > 0 ? avgJitter : 0.0) << ","
+                      << currentFPS_ << "," << avgDelay << "\n";
+
+      // Flush periodically
+      if (frameCount_ % 30 == 0) {
+        statsLogStream_.flush();
+      }
+    }
+  }
+
+  void dumpFinalStats() {
+    if (!statsLogStream_.is_open()) {
+      return;
+    }
+
+    double avgJitter = jitterCount_ > 0 ? jitterSum_ / jitterCount_ : 0.0;
+    double avgDelay = delayCount_ > 0 ? totalDelay_ / delayCount_ : 0.0;
+    double overallFPS = 0.0;
+
+    auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            lastArrivalTime_ - firstArrivalTime_)
+                            .count();
+    if (totalElapsed > 0) {
+      overallFPS = frameCount_ * 1000.0 / totalElapsed;
+    }
+
+    statsLogStream_ << "\n=== " << trackMediaType_.toStr()
+                    << " Final Statistics ===\n";
+    statsLogStream_ << "Total Frames: " << frameCount_ << "\n";
+    statsLogStream_ << "Average FPS: " << overallFPS << "\n";
+    statsLogStream_ << "Average Frame Delay: " << avgDelay << " ms\n";
+    statsLogStream_ << "Min Frame Delay: " << minDelay_ << " ms\n";
+    statsLogStream_ << "Max Frame Delay: " << maxDelay_ << " ms\n";
+    statsLogStream_ << "Average Jitter: " << avgJitter << " ms\n";
+    statsLogStream_ << "Max Jitter: " << maxJitter_ << " ms\n";
+    statsLogStream_ << "Total Duration: " << totalElapsed << " ms\n";
+    statsLogStream_.flush();
+  }
+
   std::shared_ptr<FlvWriterShared> flvw_;
   TrackType trackMediaType_;
   std::unique_ptr<dejitter::DeJitter<MoQMi::MoqMiItem>> deJitter_;
   uint32_t dejitterBufferSizeMs_;
+
+  // Statistics tracking
+  std::string statsLogFile_;
+  std::ofstream statsLogStream_;
+  uint64_t frameCount_{0};
+  uint64_t lastFrameCount_{0};
+  double currentFPS_{0.0};
+  std::chrono::steady_clock::time_point fpsStartTime_{
+      std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point firstArrivalTime_{
+      std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point lastArrivalTime_{};
+  double lastInterArrivalTime_{0.0};
+  double totalDelay_{0.0};
+  uint64_t delayCount_{0};
+  double minDelay_{-1.0};
+  double maxDelay_{0.0};
+  double jitterSum_{0.0};
+  uint64_t jitterCount_{0};
+  double maxJitter_{0.0};
 };
 
 class MoQFlvReceiverClient
     : public Subscriber,
       public std::enable_shared_from_this<MoQFlvReceiverClient> {
  public:
-  MoQFlvReceiverClient(
-      folly::EventBase* evb,
-      proxygen::URL url,
-      bool useQuic,
-      const std::string& flvOutPath)
+  MoQFlvReceiverClient(folly::EventBase* evb, proxygen::URL url, bool useQuic,
+                       const std::string& flvOutPath)
       : moqExecutor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
         moqClient_(makeMoQClient(moqExecutor_, std::move(url), useQuic)),
         flvOutPath_(flvOutPath) {}
@@ -382,8 +567,7 @@ class MoQFlvReceiverClient
           std::chrono::milliseconds(FLAGS_connect_timeout),
           std::chrono::seconds(FLAGS_transaction_timeout),
           /*publishHandler=*/nullptr,
-          /*subscribeHandler=*/shared_from_this(),
-          quic::TransportSettings());
+          /*subscribeHandler=*/shared_from_this(), quic::TransportSettings());
       // Create output file
       flvw_ = std::make_shared<FlvWriterShared>(flvOutPath_);
       trackReceiverHandlerAudio_->setFlvWriterShared(flvw_);
@@ -394,28 +578,18 @@ class MoQFlvReceiverClient
 
       auto subAudio = SubscribeRequest::make(
           moxygen::FullTrackName(
-              {{TrackNamespace(
-                   FLAGS_track_namespace, FLAGS_track_namespace_delimiter)},
+              {{TrackNamespace(FLAGS_track_namespace,
+                               FLAGS_track_namespace_delimiter)},
                FLAGS_audio_track_name}),
-          0,
-          GroupOrder::OldestFirst,
-          true,
-          LocationType::LargestObject,
-          folly::none,
-          0,
-          {getAuthParam(negotiatedVersion, FLAGS_auth)});
+          0, GroupOrder::OldestFirst, true, LocationType::LargestObject,
+          folly::none, 0, {getAuthParam(negotiatedVersion, FLAGS_auth)});
       auto subVideo = SubscribeRequest::make(
           moxygen::FullTrackName(
-              {TrackNamespace(
-                   FLAGS_track_namespace, FLAGS_track_namespace_delimiter),
+              {TrackNamespace(FLAGS_track_namespace,
+                              FLAGS_track_namespace_delimiter),
                FLAGS_video_track_name}),
-          0,
-          GroupOrder::OldestFirst,
-          true,
-          LocationType::LargestObject,
-          folly::none,
-          0,
-          {getAuthParam(negotiatedVersion, FLAGS_auth)});
+          0, GroupOrder::OldestFirst, true, LocationType::LargestObject,
+          folly::none, 0, {getAuthParam(negotiatedVersion, FLAGS_auth)});
 
       // Subscribe to audio
       subRxHandlerAudio_ = std::make_shared<ObjectReceiver>(
@@ -472,8 +646,7 @@ class MoQFlvReceiverClient
   }
 
   folly::coro::Task<AnnounceResult> announce(
-      Announce announce,
-      std::shared_ptr<AnnounceCallback>) override {
+      Announce announce, std::shared_ptr<AnnounceCallback>) override {
     XLOG(INFO) << "Announce ns=" << announce.trackNamespace;
     // receiver client doesn't expect server or relay to announce anything, but
     // announce OK anyways
@@ -507,17 +680,17 @@ class MoQFlvReceiverClient
   std::string flvOutPath_;
   std::shared_ptr<FlvWriterShared> flvw_;
   std::shared_ptr<TrackReceiverHandler> trackReceiverHandlerAudio_ =
-      std::make_shared<TrackReceiverHandler>(
-          TrackType::MediaType::Audio,
-          FLAGS_dejitter_buffer_size_ms);
+      std::make_shared<TrackReceiverHandler>(TrackType::MediaType::Audio,
+                                             FLAGS_dejitter_buffer_size_ms,
+                                             FLAGS_stats_log_file);
   std::shared_ptr<ObjectReceiver> subRxHandlerAudio_;
   std::shared_ptr<TrackReceiverHandler> trackReceiverHandlerVideo_ =
-      std::make_shared<TrackReceiverHandler>(
-          TrackType::MediaType::Video,
-          FLAGS_dejitter_buffer_size_ms);
+      std::make_shared<TrackReceiverHandler>(TrackType::MediaType::Video,
+                                             FLAGS_dejitter_buffer_size_ms,
+                                             FLAGS_stats_log_file);
   std::shared_ptr<ObjectReceiver> subRxHandlerVideo_;
 };
-} // namespace
+}  // namespace
 
 using namespace moxygen;
 
